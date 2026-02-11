@@ -1,0 +1,507 @@
+.pos 0
+
+main:
+# ||                        Reflection                              ||
+
+# || -  Runtime instruction count: 30 693 (with 18 test values),    ||
+# ||    last being a prime of 999931 (others non-prime)             ||
+
+# || -  I optimized the program most efficiently by checking        ||
+# ||    bitmask > exponent in both efficient_mult and modexp.       ||
+# ||    The optimization worked especially well with modexp.        ||
+
+# || -  One huge optimization was the total register overhaul, so   ||
+# ||    that rsi and r8 were global and the other registers were    ||
+# ||    used consistently throughout the subroutines, which nearly  ||
+# ||    eliminated all need for push/pop and minimized register     ||
+# ||    shuffling as well                                           ||
+
+# || -  Another big optimization was instead of resetting the d.div ||
+# ||    in efficient_mod was storing the largest accepted divisor   ||
+# ||    on stack, so that I don't need to loop back up from 2 every ||
+# ||    time. It reduced ecciciency for smaller values, but greatly ||
+# ||    increased for larger values.                                ||
+
+# || -  After the huge register overhaul I can't think of any huge  ||
+# ||    optimizations, only to possibly locate unnecessary assigns  ||
+# ||    to "garbage" registers, especially in modpow or its sub-    ||
+# ||    routines.                                                   ||
+
+# || -  The biggest optimization choice(s) were using the bitmasks  ||
+# ||    and I'm not sure on the exact results, but before applying  ||
+# ||    Miller Rabin round, it took roughly 18 seconds to run this  ||
+# ||    program and after adapting the bitmask > exponent in modexp ||
+# ||    AND adapting Miller Rabin, the runtime dropped down to ~2s, ||
+# ||    which suggests roughly ~1000% runtime decrease.             ||
+
+# ||    BELOW ROUGH ESTIMATIONS OF SUBROUTINE INSTRUCTION COUNTS    ||
+
+# ||                    eff_div_by_two                              ||
+# || -  Loops through 63 bits (skips first bit) with 8 instructions ||
+# ||    63 * 7.5 + 3 (setup) + 2 (finish) ~ 475 instructions        ||
+
+# ||                    efficient_mult                              ||
+# || -  Best case 7 instructions (0 multipl.), worst case 64*14 =   ||
+# ||    896 + 5 (setup+finish) ~ 900, average ~450 instructions     ||
+
+# ||                    efficient_mod                               ||
+# || -  (For the rest I just asked AI)                              ||
+# ||    "Best case divisor > dividend = 4, average ~10 instructions ||
+# ||    per bit of quotient ~60x12 = 720 steps"                     ||
+
+# ||                    modexp (my worst enemy)                     ||
+# || -  (Asked AI for instruction count estimate) "First square step||
+# ||    per-bit cost ~efficient_mult+efficient_mod+overhead ~1500   ||
+# ||    Multiply step: -,,- ~1500 (minor overhead difference)       ||
+# ||    Processing a 60 bit number, where half of bits are zeroes   ||
+# ||    ~1500*(60+30) = 135 000" Personally I used values much under||
+# ||    60 bits, so that's why my instruction count was only ~30k   ||
+
+# ||            I'm lumping the main function here together         ||
+# || -  (Asked AI here as well) "For a full 64-bit prime: 1.5-2 mil,||
+# ||    for a standard non-prime, global average would be roughly   ||
+# ||    75000 instructions" So in conclusion worst case scenario    ||
+# ||    would probably be somewhere in the high 3 millions, assuming||
+# ||    difficult non-primes and a big prime at the end (my guess)  ||
+
+# || I will try to keep the following as consistent as possible ||
+# || (considering I did a whole register overhaul at 4 am and I ||
+# || don't want it to be for nothing)                           ||                                  
+
+# || IMPORTANT REGISTERS                                        ||
+
+# || %r9 = witness (= base for modpow) bringing back with (%rsi)||
+# || %r10 = p (= exp for modpow)                                ||
+# || %r11 = N (= modulo for modpow) %r11 is unchanged in modpow ||
+# || %r8 = N_list (global)                                      ||
+# || %rsi = witness_list location (global)                      ||
+# || %rax, used to return function values occasionally          ||
+
+# || GARBAGE/SCRATCH REGISTERS                                  ||
+
+# || %rbx, %rcx, %rdx                                           ||
+
+	irmovq stack, %rsp
+    irmovq stack, %rbp
+    irmovq number_list, %r8
+    jmp number_loop
+
+
+# || Number loop, so it begins...               ||
+# || Retrieves N, checks for N <= 2 and even    ||
+# || numbers, then calls witness_loop           ||
+
+# || INPUT                                      ||
+# || %r8 = list start address (global)          ||
+
+
+# || OUTPUT                                     ||
+# || %rax = result (0 = no primes/empty list)   ||
+# || if a prime, return N in rax                ||
+
+# || OTHER IMPORTANT REGISTERS                  ||
+# || %rdi is globally available;                ||
+# || not used in any "functions", or lists      ||
+
+
+number_loop:
+    mrmovq (%r8), %r11                  # Retrieve N from list
+    rrmovq %r11, %rcx                   # Temp N for subq comparisons
+    andq %r11, %r11                     # List is done => no primes
+    je done_not_prime
+    
+    irmovq $1, %rbx                     # Check N = 1
+    subq %rbx, %rcx                     # N - 1
+    je next_value
+    jle next_value                      # Checks N < 0
+    
+    irmovq $2, %rbx                     # Check N = 2
+    rrmovq %r11, %rcx                   # Reset the temp N
+    subq %rbx, %rcx                     # N - 2
+    je done_prime
+    
+    rrmovq %r11, %rcx                   # Reset the temp N
+    irmovq $1, %rbx                     # Set bitmask to 1 for even check
+    andq %rbx, %rcx                     # If LSB is 0, number is even
+    je next_value
+
+    irmovq witness_list, %rsi           # witness_list address to rsi
+    jmp witness_loop
+
+# || Witness loop                               ||
+# || Checks for witness = 0 and witness >= N    ||
+# || if either condition fulfilled, N = prime   ||
+
+# || INPUT                                      ||
+# || %rax = number checked for primality = N    ||
+# || (%rsi) = witness number                    ||
+
+
+# || OUTPUT                                     ||
+# || %rax = result (0 = no primes/empty list)   ||
+
+# || OTHER IMPORTANT REGISTERS                  ||
+# || %rax holds N, %rsi holds witness           ||
+# || %r9 = witness, %r10 = p = N - 1            ||
+
+witness_loop:
+
+    mrmovq (%rsi), %r9              # Retrieve witness to r9 for modpow
+    andq %r9, %r9                   # Check for 0 (end of list)
+    je done_prime                   # If witness = 0, last number was prime
+    
+# Here we check witness >= N and set it prime if this happens
+
+    rrmovq %r11, %rcx               # Copy of witness for subq
+    subq %r9, %rcx                  # N - witness, SF or OF set if witness >= N
+    jle done_prime                  # N = prime
+    
+    rrmovq %r11, %r10               # temp copy of N to r10
+    irmovq $1, %rbx                 # 1 to rbx
+    subq %rbx, %r10                 # r10 = N - 1 = p
+    
+    call modpow                     # result = witness^(p) % N | r9^r10 % r11
+    
+    rrmovq %rax, %r12               # Save result to r12
+    
+    irmovq $1, %rbx                 # 1 to register
+    subq %rbx, %r12                 # If result != 1, current witness passed
+    
+    jne next_value
+
+# || Miller Rabin round                 ||
+
+# || Input                              ||
+
+# || %r11 = N                           ||
+# || %r10 = p
+# || (%rsi) = witness (=%r9 for modpow) ||
+
+# || Output                             ||
+# || %rax                               ||
+# || 0 for composite                    ||
+# || N for N = prime                    ||
+
+mr_round:
+
+# If 1 - p = 0, N is prime
+    
+    irmovq $1, %rbx                 # 1 to register
+    andq %r10, %rbx                 # Checking LSB
+    jne next_witness                # If r10 = odd, current witness passed
+
+
+# p = halve(p)
+    call eff_div_by_two             # r10 is updated directly
+
+
+# Fetching witness, since modpow destroyed it earlier
+    mrmovq (%rsi), %r9
+
+
+# result (rax) = modpow(witness, p, number)
+    call modpow                     # result = witness^(p/2) % N
+    rrmovq %rax, %r12               # Save to r12 just in case
+    
+# Check if result = 1
+    irmovq $1, %rbx
+    subq %r12, %rbx                 # 1 - result
+    je mr_round                     # If result = 1, continue
+
+# Check if result = N - 1
+    rrmovq %r11, %rbx               # temp for N
+    irmovq $1, %rcx
+    subq %rcx, %rbx                 # N - 1 = rbx
+    subq %r12, %rbx                 # N - 1 - result
+    je done_prime                   # If result = N-1, N = prime
+    
+    jmp next_value                  # If both fail, it's a composite
+
+
+next_witness:
+    irmovq $8, %rdx
+    addq %rdx, %rsi
+    jmp witness_loop
+
+next_value:
+    irmovq $8, %rax
+    addq %rax, %r8
+    jmp number_loop
+
+done_prime:
+    rrmovq %r11, %rax               # Theoretically r11 should hold N
+    halt
+
+done_not_prime:
+    irmovq $0, %rax
+    halt
+
+# || MODULAR EXPONENTIATION, God help me ||
+
+# || I managed to  optimize this by a    ||
+# || lot when I realized I could do the  ||
+# || same thing as in efficient_mul by   ||
+# || comparing the exponent and bitmask  ||
+
+# || INPUT                               ||
+# || %r9 = base                          ||
+# || %r10 = exponent                     ||
+# || %r11 = modulo                       ||
+
+# || OUTPUT                              ||
+# || %rax = result                       ||
+
+# || OTHER IMPORTANT REGISTERS           ||
+# || %rbx = exponent bitmask             ||
+# || %rcx = (temp) exponent              ||
+
+# || REGISTERS IN USE                    ||
+# || %rax, %rbx, %rcx, (%r9), (%r10)	 ||
+# || (%r11), (%r12)                      ||
+
+modpow:
+    
+    rrmovq %r9, %rax        # r9 -> rax (for modulo)
+    pushq %r10
+    call efficient_mod
+    popq %r10
+    rrmovq %rax, %r9        # %r9 = base (= base % mod)
+    
+    irmovq $1, %rax         # %rax = result, 1 presumably because n^0 = 1
+    irmovq $1, %rbx         # %rbx = exponent bitmask, initialized to 1
+
+exp_loop:
+	
+	rrmovq %rbx, %rcx
+	subq %r10, %rcx
+	jg modpow_done			# If Mask > Exp, skip to done
+	
+    rrmovq %r10, %rcx
+    andq %rbx, %rcx
+    je skip_mult_step
+
+    pushq %r9               # Push values to stack for safe storage
+    pushq %r10              # EXP
+    pushq %rax              # Multiplicand
+    
+    call efficient_mult     # rax = result * base 
+	rrmovq %rax, %r9		# Move rax to dividend register (r9)
+	
+	
+    call efficient_mod      # result (rax) = (result * base) % mod
+    
+    rrmovq %rax, %r12       # rax -> r12 (Save result)
+    
+	popq %rax               # Restore values from stack
+    popq %r10
+    popq %r9
+    
+	rrmovq %r12, %rax       # Move result back to rax, discarding old one
+
+skip_mult_step:
+    pushq %rax
+    pushq %r10
+
+    
+    rrmovq %r9, %rax      
+    call efficient_mult     # rax = base^2 
+	rrmovq %rax, %r9
+	
+	
+    call efficient_mod      # base = base^2 % mod
+    
+    rrmovq %rax, %r9        # Save new base
+    
+
+    popq %r10
+    popq %rax               # Restore result
+
+
+    addq %rbx, %rbx
+    je modpow_done
+    jl modpow_done
+    jmp exp_loop
+
+modpow_done:
+    ret
+
+
+# ||            MODULO              	|| 
+# || INPUT                   		    ||
+# || %r9 = dividend    		            ||
+# || %r11 = divisor     	            ||
+
+# || OUTPUT            		            ||
+# || %rax = result                      ||
+
+# || OTHER IMPORTANT REGISTERS      	||
+# || %r10 = doubling divisor (d.div) 	||
+# || %r12 = temp for dividend       
+
+# || REGISTERS IN USE               	||
+# || (%r9), (%r10 (%r11), %r12, %r13    ||
+
+
+efficient_mod:
+    rrmovq %r11, %r10           # Current d.div
+    rrmovq %r9, %r12            # Copy dividend to temp register
+    subq %r11, %r12             # Calculate (Dividend - Original Divisor)
+    jl mod_done                 # If Dividend < Divisor, jump immediately to done
+
+mod_doubling_loop:
+    rrmovq %r9, %r12            # Temp divid for comparison
+    subq %r10, %r12             # Temp divid - temp d.div
+    jl mod_reset_div            # Reset divis if d.div > divid
+
+    pushq %r10                  # Saving divisor before double
+    addq %r10, %r10             # Double the d.div
+    jmp mod_doubling_loop
+
+mod_reset_div:                  
+    popq %r10                   # Pop the largest valid div. from stack
+    
+    rrmovq %r9, %r12            # Temp dividend for non-destructive comparison
+    subq %r10, %r12             # Check whether remaining divid - og div > 0
+    jl mod_check_base
+    
+    subq %r10, %r9
+
+mod_check_base:
+	rrmovq %r10, %r12
+    subq %r11, %r12             # Compare popped value to original divis
+    je mod_done                 # If we just popped the original divisor, we are done
+    jmp mod_reset_div           # Else, loop back to pop the next value
+
+mod_done:                       # When remainder =/ 0
+	rrmovq %r9, %rax
+    ret
+
+
+
+
+# ||        MULTIPLICATION          || 
+
+# || INPUT                          ||
+# || %rax = multiplicand            ||
+# || %r9 = multiplier               ||
+
+# || OUTPUT                         ||
+# || %rax = result                  ||
+
+# || REGISTERS IN USE               ||
+# || %rax, %rcx, %r12, %r13, %r14   ||
+
+# Optimized the multiplication so that it doesn't loop through all 64 bits
+# if unnecessary by checking if bitmask > multiplier
+
+
+efficient_mult:	
+    rrmovq %rax, %r12           # rax -> r12 (to prevent shuffling in modpow)
+    rrmovq %r9, %r13            # r9 -> r13 (-,,-)
+    irmovq $0, %rax             # Result
+    irmovq $1, %r14             # Bit mask, start at the LSB and move to MSB
+
+mult_loop:
+	rrmovq %r13, %rcx			# Copy multiplier
+	subq %r14, %rcx				# Comparing multiplier with bitmask
+	jl mult_done                # If bitmask > multiplier, ret
+
+	andq %r13, %r13 			# Check for zero
+	je mult_done
+	
+    rrmovq %r13, %rcx           # Copy multiplier
+    andq %r14, %rcx             # Check if multiplier's current bit is 1
+    je mult_next_bit            # If result is 0, don't add
+    
+    addq %r12, %rax     
+
+mult_next_bit:
+    addq %r12, %r12             # Shift multiplicand left
+    addq %r14, %r14             # Shift bit mask left to check the next bit
+    je mult_done                # If mask is 0, we've processed all the bits
+    jl mult_done                # Safety check for the sign bit
+    jmp mult_loop
+
+mult_done:
+    ret
+
+# ||    EFFICIENT DIVISION BY 2         || 
+
+# || INPUT                              ||
+# || %r10 = number to be divid by 2     ||
+
+# || OUTPUT                             ||
+# || %rax = result                      ||
+
+# || OTHER IMPORTANT REGISTERS          ||
+# || %r12 = cursor bitmask              ||
+# || %r13 = addition bit			    ||
+# || %r14 = temp for dividend           ||
+
+# || REGISTERS IN USE                   ||
+# || %rax, %r9, %r10, %r12, %r13, %r14  ||
+
+
+eff_div_by_two:
+    irmovq $0, %rax         # Result
+    irmovq $2, %r12         # Cursor bitmask (start at 010)
+    irmovq $1, %r13         # Addition bit
+    
+eff_div_two_loop:
+    rrmovq %r10, %r14        # Move the dividend to a temp holder
+    andq %r12, %r14         # Check if dividend's current bit is set
+    je next_divtwo_bit
+    
+    addq %r13, %rax         # rax = prev_bit + rax
+    
+next_divtwo_bit:
+    addq %r13, %r13         # Shift the addition bit first
+    addq %r12, %r12         # Shift cursor bitmask left to check the next bit
+    je div_two_done
+    
+    jmp eff_div_two_loop
+
+div_two_done:
+    rrmovq %rax, %r10
+    ret
+
+
+.pos 0x1400
+.align 8
+witness_list:
+    .quad 2
+    .quad 3
+    .quad 5
+    .quad 7
+    .quad 11
+    .quad 13
+    .quad 17
+    .quad 19
+    .quad 23
+    .quad 29
+    .quad 31
+    .quad 37
+    .quad 0
+
+.pos 0x1800
+.align 8
+number_list:
+    .quad -123123
+    .quad 4
+    .quad 2022020202022
+    .quad 121
+    .quad 2222
+    .quad 2222
+    .quad 14
+    .quad 18
+    .quad 18
+    .quad 18
+    .quad 18
+    .quad 18
+    .quad 18
+    .quad 1073741827
+    .quad 0
+
+.pos 0x2000
+stack:
+
