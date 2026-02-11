@@ -1,8 +1,6 @@
 .pos 0
 
 main:
-# ||                        Reflection                              ||
-
 # || -  Runtime instruction count: 30 693 (with 18 test values),    ||
 # ||    last being a prime of 999931 (others non-prime)             ||
 
